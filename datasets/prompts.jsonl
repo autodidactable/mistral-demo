@@ -1,0 +1,3 @@
+{"input":{"user_prompt":"Explain Cleopatra's impact on Egyptian history","voice_profile":"female_warm_neutral","speech_rate":1.0,"seed":42,"lang":"en-US"},"expected":null,"metadata":{"topic":"history","reviewer":["Elaine"]}}
+{"input":{"user_prompt":"Why is the moon round?","voice_profile":"male_calm_inquisitive","speech_rate":0.95,"seed":42,"lang":"en-US"},"expected":null,"metadata":{"topic":"science","reviewer":["Elaine"]}}
+{"input":{"user_prompt":"Describe the water cycle to a 10-year-old","voice_profile":"female_friendly","speech_rate":1.05,"seed":42,"lang":"en-US"},"expected":null,"metadata":{"topic":"education","reviewer":["Elaine"]}}
