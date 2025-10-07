@@ -3,10 +3,9 @@
 Braintrust SDK + OpenAI SDK (wrapped with braintrust.wrap_openai)
 Reads test cases from a Braintrust Dataset (default name: 'mistral').
 
-- Child spans via @traced(type=..., name=..., notrace_io=True)
-- Structured logging with current_span().log (allowed keys only)
-- Original function names preserved:
-    openai_chat_audio, openai_transcribe, openai_judge, prosody_tag_stub
+Child spans via @traced(type=..., name=..., notrace_io=True)
+Original function names preserved:
+  openai_chat_audio, openai_transcribe, openai_judge, prosody_tag_stub
 """
 
 import os, io, json, base64
@@ -16,7 +15,7 @@ from typing import Dict, Any, Optional, Tuple
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    load_dotenv("mistral-tts-eval/.env")   # optional extra
+    load_dotenv("mistral-tts-eval/.env")
 except Exception:
     pass
 
@@ -40,10 +39,7 @@ client = wrap_openai(OpenAI(api_key=OPENAI_API_KEY))  # all calls go through Bra
 def data_url(mime: str, b: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(b).decode('utf-8')}"
 
-OPENAI_VOICE_MAP = {
-    "female_warm_neutral": "alloy",
-    "male_calm_inquisitive": "verse",
-}
+OPENAI_VOICE_MAP = {"female_warm_neutral": "alloy", "male_calm_inquisitive": "verse"}
 def resolve_voice(profile: Optional[str]) -> str:
     return OPENAI_VOICE_MAP.get(profile or "", "alloy")
 
@@ -67,17 +63,16 @@ def openai_chat_audio(prompt: str,
         model=model,
         messages=[
             {"role": "system",
-             "content": "You are a helpful expert. Answer concisely (3-6 sentences), in a warm explanatory tone."},
+             "content": "You are a helpful expert. Answer concisely (3–6 sentences), in a warm explanatory tone."},
             {"role": "user", "content": prompt},
         ],
         modalities=["text", "audio"],
         audio={"voice": voice, "format": audio_format},
         temperature=0.3,
     )
-
     audio_b64 = None
     try:
-        audio_b64 = resp.choices[0].message.audio.data  # preferred shape
+        audio_b64 = resp.choices[0].message.audio.data
     except Exception:
         try:
             parts = getattr(resp.choices[0].message, "content", None) or []
@@ -90,7 +85,6 @@ def openai_chat_audio(prompt: str,
                     if audio_b64: break
         except Exception:
             pass
-
     if not audio_b64:
         raise RuntimeError("Chat audio response missing base64 audio.")
 
@@ -98,24 +92,17 @@ def openai_chat_audio(prompt: str,
     mime = f"audio/{audio_format}"
     audio_url = data_url(mime, audio_bytes)
 
+    # tiny metrics for annotation
     prompt_tokens = max(1, len(prompt) // 4)
     completion_tokens = max(1, len(audio_bytes) // 320)
 
     current_span().log(
         input=[{"role": "user", "content": prompt}],
         output={"audio_format": mime, "voice": voice},
-        metrics=dict(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            tokens=prompt_tokens + completion_tokens,
-        ),
-        metadata={
-            "provider": "openai",
-            "model": model,
-            "voice": voice,
-            "format": audio_format,
-            "artifacts": {"audio": audio_url},  # data-URL stored in metadata
-        },
+        metrics=dict(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                     tokens=prompt_tokens + completion_tokens),
+        metadata={"provider": "openai", "model": model, "voice": voice, "format": audio_format,
+                  "artifacts": {"audio": audio_url}},
     )
     return audio_bytes, mime
 
@@ -123,31 +110,21 @@ def openai_chat_audio(prompt: str,
 def openai_transcribe(audio_bytes: bytes,
                       filename: str = "audio.mp3",
                       model: str = "whisper-1") -> str:
-    bio = io.BytesIO(audio_bytes)
-    bio.name = filename
-    resp = client.audio.transcriptions.create(
-        model=model,
-        file=bio,
-        response_format="json",
-    )
+    bio = io.BytesIO(audio_bytes); bio.name = filename
+    resp = client.audio.transcriptions.create(model=model, file=bio, response_format="json")
     text = getattr(resp, "text", None)
-    if text is None and isinstance(resp, dict):
-        text = resp.get("text", "")
-    if text is None:
-        text = ""
+    if text is None and isinstance(resp, dict): text = resp.get("text", "")
+    if text is None: text = ""
 
     tagged = prosody_tag_stub(text)
     current_span().log(
         input={"filename": filename, "bytes": len(audio_bytes)},
         output={"transcript_len": len(text)},
-        metadata={
-            "provider": "openai",
-            "model": model,
-            "artifacts": {
-                "transcript_raw":    data_url("text/plain", text.encode("utf-8")),
-                "transcript_tagged": data_url("text/plain", tagged.encode("utf-8")),
-            },
-        },
+        metadata={"provider": "openai", "model": model,
+                  "artifacts": {
+                      "transcript_raw":    data_url("text/plain", text.encode("utf-8")),
+                      "transcript_tagged": data_url("text/plain", tagged.encode("utf-8")),
+                  }},
     )
     return text
 
@@ -192,15 +169,14 @@ def openai_judge(prompt: str, transcript: str) -> dict:
     )
     return raw
 
-# ── Runner (root span + child spans via the traced functions above) ────────────
-def run_example(prompt: str, *, voice_profile: Optional[str] = None):
-    voice = resolve_voice(voice_profile)
+# ── Runner (root span + child spans via traced functions) ──────────────────────
+def run_example(prompt: str, expected: Optional[str] = None):
+    voice = resolve_voice(None) 
 
     with start_span(name="eval_case") as root:
         # TTS
-        audio_bytes, mime = openai_chat_audio(
-            prompt, model="gpt-4o-mini-audio-preview", voice=voice, audio_format="mp3"
-        )
+        audio_bytes, mime = openai_chat_audio(prompt, model="gpt-4o-mini-audio-preview",
+                                              voice=voice, audio_format="mp3")
         audio_url = data_url(mime, audio_bytes)
 
         # ASR
@@ -214,6 +190,7 @@ def run_example(prompt: str, *, voice_profile: Optional[str] = None):
         # Root summary (allowed keys only)
         root.log(
             input=prompt,
+            expected=(expected or ""),   # populate Expected column from dataset
             output=transcript_tagged,
             metrics=scores_01,
             metadata={
@@ -222,7 +199,7 @@ def run_example(prompt: str, *, voice_profile: Optional[str] = None):
                 "tts_model": "gpt-4o-mini-audio-preview",
                 "judge_model": JUDGE_MODEL,
                 "judge_raw_1to5": raw_1to5,
-                "artifacts": {  # data URLs kept here
+                "artifacts": {
                     "audio":             audio_url,
                     "transcript_raw":    data_url("text/plain", transcript_raw.encode("utf-8")),
                     "transcript_tagged": data_url("text/plain", transcript_tagged.encode("utf-8")),
@@ -231,42 +208,22 @@ def run_example(prompt: str, *, voice_profile: Optional[str] = None):
         )
         print(f"[BT] traced via SDK: '{prompt[:60]}...'  mime={mime}")
 
-# ── Main: iterate Braintrust Dataset instead of prompts.jsonl ──────────────────
-def _prompt_from_dataset_row(row: Any) -> Optional[str]:
-    """
-    Accepts Braintrust Datum objects or dicts/strings and extracts the prompt string.
-    Dataset 'mistral' rows are assumed to have top-level 'input' (string).
-    """
-    # Datum object
-    if hasattr(row, "input"):
-        v = getattr(row, "input")
-        return v if isinstance(v, str) else (v.get("user_prompt") or v.get("prompt") if isinstance(v, dict) else None)
-    # Mapping
-    if isinstance(row, dict):
-        v = row.get("input") or row.get("prompt") or row.get("user_prompt") or row.get("text")
-        return v if isinstance(v, str) else (v.get("user_prompt") or v.get("prompt") if isinstance(v, dict) else None)
-    # Primitive
-    if isinstance(row, str):
-        return row
-    return None
-
+# ── Main: iterate Braintrust Dataset (rows with input/expected strings) ────────
 def main():
-    # Attach dataset by NAME (minimal change); set BT_DATASET_NAME in .env to override
     ds = init_dataset(project=PROJECT_REF, name=DATASET_NAME)
 
     n = 0
     for row in ds:
-        prompt = _prompt_from_dataset_row(row)
-        if not prompt:
+        if hasattr(row, "input"):
+            prompt = row.input
+            expected = getattr(row, "expected", "") or ""
+        else:
+            prompt = (row.get("input") if isinstance(row, dict) else None)
+            expected = (row.get("expected") if isinstance(row, dict) else "") or ""
+        if not isinstance(prompt, str) or not prompt.strip():
             continue
-        # (optional) pull a voice profile if present
-        voice_profile = None
-        if hasattr(row, "metadata") and isinstance(getattr(row, "metadata"), dict):
-            voice_profile = row.metadata.get("voice_profile")
-        elif isinstance(row, dict):
-            voice_profile = (row.get("metadata") or {}).get("voice_profile")
 
-        run_example(prompt, voice_profile=voice_profile)
+        run_example(prompt.strip(), expected.strip())
         n += 1
 
     print(f"Completed {n} prompts.")
