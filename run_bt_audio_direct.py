@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Braintrust SDK + OpenAI SDK (wrapped with braintrust.wrap_openai)
+Reads test cases from a Braintrust Dataset (default name: 'mistral').
+
 - Child spans via @traced(type=..., name=..., notrace_io=True)
 - Structured logging with current_span().log (allowed keys only)
 - Original function names preserved:
@@ -21,12 +23,14 @@ except Exception:
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
 PROJECT_NAME       = (os.getenv("BRAINTRUST_PROJECT") or "").strip().strip('"').strip("'")
 PROJECT_ID         = (os.getenv("BRAINTRUST_PROJECT_ID") or "").strip().strip('"').strip("'")
+DATASET_NAME       = (os.getenv("BT_DATASET_NAME") or os.getenv("DATASET_NAME") or "mistral").strip()
+
 if not OPENAI_API_KEY or not (PROJECT_NAME or PROJECT_ID):
     raise SystemExit("Missing env: OPENAI_API_KEY and BRAINTRUST_PROJECT (name) or BRAINTRUST_PROJECT_ID")
 PROJECT_REF = PROJECT_NAME or PROJECT_ID
 
-# ── Braintrust SDK (doc-style) + OpenAI SDK (wrapped) ─────────────────────────
-from braintrust import init_logger, current_span, start_span, traced, wrap_openai
+# ── Braintrust SDK + OpenAI SDK (wrapped) ─────────────────────────────────────
+from braintrust import init_logger, current_span, start_span, traced, wrap_openai, init_dataset
 from openai import OpenAI
 
 logger = init_logger(project=PROJECT_REF)
@@ -59,9 +63,6 @@ def openai_chat_audio(prompt: str,
                       model: str = "gpt-4o-mini-audio-preview",
                       voice: str = "alloy",
                       audio_format: str = "mp3") -> Tuple[bytes, str]:
-    """
-    Returns (audio_bytes, mime). OpenAI SDK call is wrapped by Braintrust.
-    """
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -74,10 +75,9 @@ def openai_chat_audio(prompt: str,
         temperature=0.3,
     )
 
-    # Robust extraction across preview shapes
     audio_b64 = None
     try:
-        audio_b64 = resp.choices[0].message.audio.data  # preferred
+        audio_b64 = resp.choices[0].message.audio.data  # preferred shape
     except Exception:
         try:
             parts = getattr(resp.choices[0].message, "content", None) or []
@@ -98,7 +98,6 @@ def openai_chat_audio(prompt: str,
     mime = f"audio/{audio_format}"
     audio_url = data_url(mime, audio_bytes)
 
-    # lightweight “metrics” for annotations (SDK log allows metrics)
     prompt_tokens = max(1, len(prompt) // 4)
     completion_tokens = max(1, len(audio_bytes) // 320)
 
@@ -115,7 +114,7 @@ def openai_chat_audio(prompt: str,
             "model": model,
             "voice": voice,
             "format": audio_format,
-            "artifacts": {"audio": audio_url},  # store data-URL artifacts under metadata
+            "artifacts": {"audio": audio_url},  # data-URL stored in metadata
         },
     )
     return audio_bytes, mime
@@ -124,19 +123,13 @@ def openai_chat_audio(prompt: str,
 def openai_transcribe(audio_bytes: bytes,
                       filename: str = "audio.mp3",
                       model: str = "whisper-1") -> str:
-    """
-    Returns transcript text. Uses wrapped OpenAI SDK audio.transcriptions.create.
-    """
-    # The OpenAI SDK accepts a file-like object; give BytesIO a name so content-type is inferred.
     bio = io.BytesIO(audio_bytes)
-    bio.name = filename  # important hint for the SDK
-
+    bio.name = filename
     resp = client.audio.transcriptions.create(
         model=model,
         file=bio,
         response_format="json",
     )
-    # normalize text
     text = getattr(resp, "text", None)
     if text is None and isinstance(resp, dict):
         text = resp.get("text", "")
@@ -144,7 +137,6 @@ def openai_transcribe(audio_bytes: bytes,
         text = ""
 
     tagged = prosody_tag_stub(text)
-
     current_span().log(
         input={"filename": filename, "bytes": len(audio_bytes)},
         output={"transcript_len": len(text)},
@@ -180,9 +172,6 @@ Return ONLY JSON:
 
 @traced(type="llm", name="Judge: LLM Scoring", notrace_io=True)
 def openai_judge(prompt: str, transcript: str) -> dict:
-    """
-    Returns raw 1–5 score dict. Uses wrapped OpenAI SDK chat.completions.
-    """
     resp = client.chat.completions.create(
         model=JUDGE_MODEL,
         messages=[
@@ -204,13 +193,8 @@ def openai_judge(prompt: str, transcript: str) -> dict:
     return raw
 
 # ── Runner (root span + child spans via the traced functions above) ────────────
-def run_example(row: Dict[str,Any]):
-    inputs = row.get("input", {}) or {}
-    prompt = (inputs.get("user_prompt") or "").strip()
-    if not prompt:
-        print("skip (empty prompt)"); return
-
-    voice = resolve_voice(inputs.get("voice_profile"))
+def run_example(prompt: str, *, voice_profile: Optional[str] = None):
+    voice = resolve_voice(voice_profile)
 
     with start_span(name="eval_case") as root:
         # TTS
@@ -247,21 +231,44 @@ def run_example(row: Dict[str,Any]):
         )
         print(f"[BT] traced via SDK: '{prompt[:60]}...'  mime={mime}")
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── Main: iterate Braintrust Dataset instead of prompts.jsonl ──────────────────
+def _prompt_from_dataset_row(row: Any) -> Optional[str]:
+    """
+    Accepts Braintrust Datum objects or dicts/strings and extracts the prompt string.
+    Dataset 'mistral' rows are assumed to have top-level 'input' (string).
+    """
+    # Datum object
+    if hasattr(row, "input"):
+        v = getattr(row, "input")
+        return v if isinstance(v, str) else (v.get("user_prompt") or v.get("prompt") if isinstance(v, dict) else None)
+    # Mapping
+    if isinstance(row, dict):
+        v = row.get("input") or row.get("prompt") or row.get("user_prompt") or row.get("text")
+        return v if isinstance(v, str) else (v.get("user_prompt") or v.get("prompt") if isinstance(v, dict) else None)
+    # Primitive
+    if isinstance(row, str):
+        return row
+    return None
+
 def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="datasets/prompts.jsonl")
-    args = ap.parse_args()
+    # Attach dataset by NAME (minimal change); set BT_DATASET_NAME in .env to override
+    ds = init_dataset(project=PROJECT_REF, name=DATASET_NAME)
 
     n = 0
-    with open(args.dataset, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            row = json.loads(line)
-            run_example(row)
-            n += 1
+    for row in ds:
+        prompt = _prompt_from_dataset_row(row)
+        if not prompt:
+            continue
+        # (optional) pull a voice profile if present
+        voice_profile = None
+        if hasattr(row, "metadata") and isinstance(getattr(row, "metadata"), dict):
+            voice_profile = row.metadata.get("voice_profile")
+        elif isinstance(row, dict):
+            voice_profile = (row.get("metadata") or {}).get("voice_profile")
+
+        run_example(prompt, voice_profile=voice_profile)
+        n += 1
+
     print(f"Completed {n} prompts.")
 
 if __name__ == "__main__":
